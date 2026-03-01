@@ -14,7 +14,7 @@ export const DEBUG_TABS = {
 type MessageStatus = typeof MESSAGE_STATUS[keyof typeof MESSAGE_STATUS];
 export type DebugTab = typeof DEBUG_TABS[keyof typeof DEBUG_TABS];
 type ChatRole = 'user' | 'assistant' | 'system';
-export type TestTargetFormat = 'openai' | 'claude';
+export type TestTargetFormat = 'openai' | 'claude' | 'responses';
 
 export type ChatMessage = {
   id: string;
@@ -256,7 +256,11 @@ const parseInputs = (value: unknown, fallbackModel = ''): ModelTesterInputs => {
 
   return {
     model,
-    targetFormat: value.targetFormat === 'claude' ? 'claude' : DEFAULT_INPUTS.targetFormat,
+    targetFormat: value.targetFormat === 'claude'
+      ? 'claude'
+      : value.targetFormat === 'responses'
+        ? 'responses'
+        : DEFAULT_INPUTS.targetFormat,
     temperature: toFiniteNumber(value.temperature, DEFAULT_INPUTS.temperature),
     top_p: toFiniteNumber(value.top_p, DEFAULT_INPUTS.top_p),
     max_tokens: toFiniteNumber(value.max_tokens, DEFAULT_INPUTS.max_tokens),
@@ -298,7 +302,7 @@ const parsePendingPayload = (value: unknown): TestChatPayload | null => {
     messages: payloadMessages,
   };
 
-  if (value.targetFormat === 'claude' || value.targetFormat === 'openai') {
+  if (value.targetFormat === 'claude' || value.targetFormat === 'openai' || value.targetFormat === 'responses') {
     payload.targetFormat = value.targetFormat;
   }
   if (typeof value.stream === 'boolean') payload.stream = value.stream;
@@ -385,7 +389,11 @@ const buildFallbackInputsFromLegacy = (value: Record<string, unknown>): ModelTes
   const inputs = parseInputs(value.inputs, legacyModel);
 
   if (!value.inputs) {
-    inputs.targetFormat = value.targetFormat === 'claude' ? 'claude' : inputs.targetFormat;
+    inputs.targetFormat = value.targetFormat === 'claude'
+      ? 'claude'
+      : value.targetFormat === 'responses'
+        ? 'responses'
+        : inputs.targetFormat;
     inputs.temperature = toFiniteNumber(value.temperature, inputs.temperature);
   }
 
@@ -511,7 +519,11 @@ export const syncMessagesToCustomRequestBody = (
   payload.model = typeof payload.model === 'string' && payload.model.trim().length > 0
     ? payload.model
     : inputs.model;
-  payload.targetFormat = payload.targetFormat === 'claude' ? 'claude' : inputs.targetFormat;
+  payload.targetFormat = payload.targetFormat === 'claude'
+    ? 'claude'
+    : payload.targetFormat === 'responses'
+      ? 'responses'
+      : inputs.targetFormat;
   payload.stream = payload.stream !== undefined ? payload.stream : inputs.stream;
   payload.messages = toApiMessages(messages);
 

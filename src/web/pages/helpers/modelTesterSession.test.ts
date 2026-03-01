@@ -199,6 +199,17 @@ describe('modelTesterSession', () => {
     expect(syncedJson.messages).toEqual([{ role: 'user', content: 'new' }]);
   });
 
+  it('keeps responses target format in custom payload sync', () => {
+    const synced = syncMessagesToCustomRequestBody(
+      '{"model":"gpt-5.2","targetFormat":"responses"}',
+      [{ id: '1', role: 'user', content: 'hello', createAt: 1 }],
+      { ...DEFAULT_INPUTS, model: 'gpt-5.2', targetFormat: 'openai' },
+    );
+
+    const syncedJson = JSON.parse(synced);
+    expect(syncedJson.targetFormat).toBe('responses');
+  });
+
   it('merges marketplace models with exact enabled route models for tester options', () => {
     const modelNames = collectModelTesterModelNames(
       {

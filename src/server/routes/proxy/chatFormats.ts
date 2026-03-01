@@ -247,6 +247,21 @@ function parseClaudeMessageContent(content: unknown): string {
   return extractTextAndReasoning(content).content;
 }
 
+function parseResponsesOutputText(payload: Record<string, unknown>): string {
+  const direct = typeof payload.output_text === 'string' ? payload.output_text : '';
+  if (direct) return direct;
+
+  const output = Array.isArray(payload.output) ? payload.output : [];
+  const parts: string[] = [];
+  for (const item of output) {
+    if (!isRecord(item)) continue;
+    const parsed = extractTextAndReasoning(item.content ?? item);
+    if (parsed.content) parts.push(parsed.content);
+  }
+
+  return parts.join('\n\n');
+}
+
 function convertClaudeRequestToOpenAiBody(body: Record<string, unknown>): {
   model: string;
   stream: boolean;
@@ -354,6 +369,19 @@ export function parseDownstreamChatRequest(
     };
   }
 
+  const hasMessages = Array.isArray(raw.messages) && raw.messages.length > 0;
+  if (!hasMessages) {
+    const hint = raw.input !== undefined
+      ? 'messages is required for /v1/chat/completions. For Responses payload, use /v1/responses.'
+      : 'messages is required';
+    return {
+      error: {
+        statusCode: 400,
+        payload: { error: { message: hint, type: 'invalid_request_error' } },
+      },
+    };
+  }
+
   return {
     value: {
       requestedModel: model,
@@ -393,6 +421,17 @@ export function normalizeUpstreamFinalResponse(
       content: parseClaudeMessageContent(payload.content) || fallbackText,
       reasoningContent: extractTextAndReasoning(payload.content).reasoning,
       finishReason: normalizeStopReason(payload.stop_reason) || 'stop',
+    };
+  }
+
+  if (isRecord(payload) && ((payload as any).object === 'response' || Array.isArray((payload as any).output))) {
+    return {
+      id: isNonEmptyString(payload.id) ? payload.id : fallbackId,
+      model: isNonEmptyString(payload.model) ? payload.model : fallbackModel,
+      created: ensureIntegerTimestamp(payload.created, now),
+      content: parseResponsesOutputText(payload) || fallbackText,
+      reasoningContent: '',
+      finishReason: normalizeStopReason(payload.finish_reason ?? payload.status) || 'stop',
     };
   }
 
@@ -468,6 +507,25 @@ export function normalizeUpstreamStreamEvent(
   }
 
   const type = typeof payload.type === 'string' ? payload.type : '';
+  if (type.startsWith('response.output_text')) {
+    const deltaText = typeof payload.delta === 'string'
+      ? payload.delta
+      : extractTextAndReasoning(payload.delta).content;
+    return {
+      contentDelta: deltaText || undefined,
+    };
+  }
+
+  if (type === 'response.completed' && isRecord((payload as any).response)) {
+    const responsePayload = (payload as any).response as Record<string, unknown>;
+    if (isNonEmptyString(responsePayload.id)) context.id = responsePayload.id;
+    if (isNonEmptyString(responsePayload.model)) context.model = responsePayload.model;
+    return {
+      finishReason: normalizeStopReason(responsePayload.status) || 'stop',
+      done: true,
+    };
+  }
+
   const message = isRecord(payload.message) ? payload.message : null;
 
   if (message) {

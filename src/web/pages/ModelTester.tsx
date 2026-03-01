@@ -93,6 +93,78 @@ const extractClaudeMessageContent = (result: any): { content: string; reasoningC
   };
 };
 
+const extractResponsesContent = (result: any): { content: string; reasoningContent: string } => {
+  const contentParts: string[] = [];
+  const reasoningParts: string[] = [];
+
+  const pushContent = (value: unknown) => {
+    if (typeof value === 'string' && value.length > 0) contentParts.push(value);
+  };
+  const pushReasoning = (value: unknown) => {
+    if (typeof value === 'string' && value.length > 0) reasoningParts.push(value);
+  };
+
+  const directOutputText = result?.output_text;
+  if (typeof directOutputText === 'string') {
+    pushContent(directOutputText);
+  } else if (Array.isArray(directOutputText)) {
+    for (const item of directOutputText) {
+      if (typeof item === 'string') {
+        pushContent(item);
+        continue;
+      }
+      if (item && typeof item === 'object' && typeof (item as any).text === 'string') {
+        pushContent((item as any).text);
+      }
+    }
+  }
+
+  const outputs = Array.isArray(result?.output)
+    ? result.output
+    : (result && typeof result === 'object' && (Array.isArray(result?.content) || typeof result?.type === 'string'))
+      ? [result]
+      : [];
+  for (const item of outputs) {
+    if (!item || typeof item !== 'object') continue;
+    const itemType = typeof item.type === 'string' ? item.type : '';
+
+    if (itemType === 'output_text') {
+      pushContent(item.text);
+      continue;
+    }
+
+    if (itemType === 'reasoning') {
+      if (typeof item.summary_text === 'string') pushReasoning(item.summary_text);
+      if (typeof item.reasoning === 'string') pushReasoning(item.reasoning);
+      if (Array.isArray(item.summary)) {
+        for (const summaryItem of item.summary) {
+          if (summaryItem && typeof summaryItem === 'object' && typeof (summaryItem as any).text === 'string') {
+            pushReasoning((summaryItem as any).text);
+          }
+        }
+      }
+    }
+
+    const content = Array.isArray((item as any).content) ? (item as any).content : [];
+    for (const block of content) {
+      if (!block || typeof block !== 'object') continue;
+      const blockType = typeof (block as any).type === 'string' ? (block as any).type : '';
+      if (blockType === 'output_text' || blockType === 'text') {
+        pushContent((block as any).text);
+        continue;
+      }
+      if (blockType.includes('reasoning')) {
+        pushReasoning((block as any).text);
+      }
+    }
+  }
+
+  return {
+    content: contentParts.join(''),
+    reasoningContent: reasoningParts.join('\n\n'),
+  };
+};
+
 const extractAssistantResult = (result: unknown): { content: string; reasoningContent: string } => {
   const data = result as any;
   let content = '';
@@ -113,6 +185,10 @@ const extractAssistantResult = (result: unknown): { content: string; reasoningCo
     const parsedClaude = extractClaudeMessageContent(data);
     content = parsedClaude.content;
     reasoning = parsedClaude.reasoningContent;
+  } else if (data?.object === 'response' || Array.isArray(data?.output) || typeof data?.output_text === 'string') {
+    const parsedResponses = extractResponsesContent(data);
+    content = parsedResponses.content;
+    reasoning = parsedResponses.reasoningContent;
   } else if (Array.isArray(data?.candidates)) {
     const parts = data?.candidates?.[0]?.content?.parts;
     if (Array.isArray(parts)) {
@@ -306,6 +382,71 @@ const parseAnyStreamDelta = (eventPayload: any): {
   }
 
   if (typeof eventPayload.type === 'string') {
+    if (eventPayload.type === 'response.output_item.added' || eventPayload.type === 'response.output_item.done') {
+      const parsed = extractResponsesContent(eventPayload.item || eventPayload.output_item || eventPayload.response || eventPayload);
+      return {
+        contentDelta: parsed.content || undefined,
+        reasoningDelta: parsed.reasoningContent || undefined,
+      };
+    }
+
+    if (eventPayload.type === 'response.content_part.added' || eventPayload.type === 'response.content_part.done') {
+      const part = eventPayload.part || eventPayload.content_part || eventPayload;
+      const parsed = extractResponsesContent(part);
+      return {
+        contentDelta: parsed.content || undefined,
+        reasoningDelta: parsed.reasoningContent || undefined,
+      };
+    }
+
+    if (eventPayload.type === 'response.content_part.delta') {
+      const delta = eventPayload.delta;
+      if (typeof delta === 'string') return { contentDelta: delta || undefined };
+      if (delta && typeof delta === 'object') {
+        const parsed = extractResponsesContent(delta);
+        if (parsed.content || parsed.reasoningContent) {
+          return {
+            contentDelta: parsed.content || undefined,
+            reasoningDelta: parsed.reasoningContent || undefined,
+          };
+        }
+        const text = typeof (delta as any).text === 'string' ? (delta as any).text : '';
+        return { contentDelta: text || undefined };
+      }
+    }
+
+    if (eventPayload.type === 'response.output_text.delta') {
+      const text = typeof eventPayload.delta === 'string'
+        ? eventPayload.delta
+        : typeof eventPayload.text === 'string'
+          ? eventPayload.text
+          : '';
+      return { contentDelta: text || undefined };
+    }
+
+    if (eventPayload.type === 'response.reasoning_summary_text.delta' || eventPayload.type === 'response.reasoning.delta') {
+      const text = typeof eventPayload.delta === 'string'
+        ? eventPayload.delta
+        : typeof eventPayload.text === 'string'
+          ? eventPayload.text
+          : '';
+      return { reasoningDelta: text || undefined };
+    }
+
+    if (eventPayload.type === 'response.output_text.done') {
+      const text = typeof eventPayload.text === 'string' ? eventPayload.text : '';
+      return { contentDelta: text || undefined };
+    }
+
+    if (eventPayload.type === 'response.completed' || eventPayload.type === 'response.failed') {
+      const parsed = extractResponsesContent(eventPayload.response || eventPayload);
+      return {
+        contentDelta: parsed.content || undefined,
+        reasoningDelta: parsed.reasoningContent || undefined,
+        done: true,
+      };
+    }
+
     if (eventPayload.type === 'content_block_delta') {
       const delta = eventPayload.delta || {};
       const deltaType = typeof delta.type === 'string' ? delta.type : '';
@@ -649,6 +790,7 @@ export default function ModelTester() {
   );
   const targetFormatOptions = useMemo<Array<{ value: TestTargetFormat; label: string }>>(() => ([
     { value: 'openai', label: 'OpenAI (/v1/chat/completions)' },
+    { value: 'responses', label: 'OpenAI Responses (/v1/responses)' },
     { value: 'claude', label: 'Claude (/v1/messages)' },
   ]), []);
 
@@ -1198,7 +1340,11 @@ export default function ModelTester() {
           <div className="stat-summary-card-value" style={{ fontSize: 14 }}>
             {(customRequestMode ? '自定义请求' : (inputs.stream ? '流式' : '任务模式'))}
             {' / '}
-            {inputs.targetFormat === 'claude' ? 'Claude' : 'OpenAI'}
+            {inputs.targetFormat === 'claude'
+              ? 'Claude'
+              : inputs.targetFormat === 'responses'
+                ? 'OpenAI Responses'
+                : 'OpenAI'}
           </div>
         </div>
       </div>

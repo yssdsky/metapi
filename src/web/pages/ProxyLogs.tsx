@@ -48,6 +48,17 @@ function latencyBgColor(ms: number) {
   return 'color-mix(in srgb, var(--color-success) 12%, transparent)';
 }
 
+function extractUpstreamPath(errorMessage?: string): string | null {
+  if (!errorMessage) return null;
+  const matched = errorMessage.match(/\[upstream:(\/v1\/[^\]]+)\]/i);
+  return matched?.[1] || null;
+}
+
+function stripUpstreamPrefix(errorMessage?: string): string {
+  if (!errorMessage) return '';
+  return errorMessage.replace(/^\[upstream:\/v1\/[^\]]+\]\s*/i, '');
+}
+
 export default function ProxyLogs() {
   const [logs, setLogs] = useState<ProxyLog[]>([]);
   const [loading, setLoading] = useState(true);
@@ -174,7 +185,10 @@ export default function ProxyLogs() {
               </tr>
             </thead>
             <tbody>
-              {paged.map(log => (
+              {paged.map(log => {
+                const upstreamPath = extractUpstreamPath(log.errorMessage);
+                const errorMessageDisplay = stripUpstreamPrefix(log.errorMessage);
+                return (
                 <React.Fragment key={log.id}>
                   <tr
                     onClick={() => setExpanded(expanded === log.id ? null : log.id)}
@@ -280,20 +294,24 @@ export default function ProxyLogs() {
                           {/* 请求路径 */}
                           <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
                             <span style={{ fontWeight: 600, color: 'var(--color-primary)', flexShrink: 0 }}>请求路径</span>
-                            <code style={{
-                              fontFamily: 'var(--font-mono)', fontSize: 12,
-                              background: 'var(--color-bg-card)', padding: '1px 8px', borderRadius: 4,
-                              border: '1px solid var(--color-border-light)',
-                            }}>
-                              /v1/chat/completions
-                            </code>
+                            {upstreamPath ? (
+                              <code style={{
+                                fontFamily: 'var(--font-mono)', fontSize: 12,
+                                background: 'var(--color-bg-card)', padding: '1px 8px', borderRadius: 4,
+                                border: '1px solid var(--color-border-light)',
+                              }}>
+                                {upstreamPath}
+                              </code>
+                            ) : (
+                              <span style={{ color: 'var(--color-text-muted)' }}>未记录</span>
+                            )}
                           </div>
 
                           {/* 错误信息 */}
-                          {log.errorMessage && (
+                          {errorMessageDisplay.trim().length > 0 && (
                             <div style={{ display: 'flex', gap: 6 }}>
                               <span style={{ fontWeight: 600, color: 'var(--color-danger)', flexShrink: 0 }}>错误信息</span>
-                              <span style={{ color: 'var(--color-danger)' }}>{log.errorMessage}</span>
+                              <span style={{ color: 'var(--color-danger)' }}>{errorMessageDisplay}</span>
                             </div>
                           )}
                         </div>
@@ -301,7 +319,7 @@ export default function ProxyLogs() {
                     </tr>
                   )}
                 </React.Fragment>
-              ))}
+              )})}
             </tbody>
           </table>
         )}

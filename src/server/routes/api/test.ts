@@ -4,7 +4,7 @@ import { fetch } from 'undici';
 import { config } from '../../config.js';
 
 type TestChatMessage = { role: string; content: string };
-type TestTargetFormat = 'openai' | 'claude';
+type TestTargetFormat = 'openai' | 'claude' | 'responses';
 
 type TestChatRequestBody = {
   model?: string;
@@ -84,7 +84,11 @@ const validatePayload = (
     return null;
   }
 
-  const targetFormat: TestTargetFormat = body.targetFormat === 'claude' ? 'claude' : 'openai';
+  const targetFormat: TestTargetFormat = body.targetFormat === 'claude'
+    ? 'claude'
+    : body.targetFormat === 'responses'
+      ? 'responses'
+      : 'openai';
 
   return {
     model: body.model,
@@ -146,6 +150,56 @@ const convertOpenAiPayloadToClaudeBody = (
   return body;
 };
 
+const convertOpenAiPayloadToResponsesBody = (
+  payload: ValidatedTestChatPayload,
+  forceStream: boolean,
+): Record<string, unknown> => {
+  const systemContents: string[] = [];
+  const messages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+
+  for (const message of payload.messages) {
+    const role = typeof message.role === 'string' ? message.role : 'user';
+    const content = typeof message.content === 'string' ? message.content : '';
+    if (!content.trim()) continue;
+
+    if (role === 'system') {
+      systemContents.push(content);
+      continue;
+    }
+
+    messages.push({
+      role: role === 'assistant' ? 'assistant' : 'user',
+      content,
+    });
+  }
+
+  const body: Record<string, unknown> = {
+    model: payload.model,
+    stream: forceStream,
+  };
+
+  if (messages.length === 1 && messages[0].role === 'user' && systemContents.length === 0) {
+    body.input = messages[0].content;
+  } else {
+    body.input = messages;
+    if (systemContents.length > 0) {
+      body.instructions = systemContents.join('\n\n');
+    }
+  }
+
+  if (typeof payload.temperature === 'number' && Number.isFinite(payload.temperature)) {
+    body.temperature = payload.temperature;
+  }
+  if (typeof payload.top_p === 'number' && Number.isFinite(payload.top_p)) {
+    body.top_p = payload.top_p;
+  }
+  body.max_output_tokens = typeof payload.max_tokens === 'number' && Number.isFinite(payload.max_tokens)
+    ? payload.max_tokens
+    : 4096;
+
+  return body;
+};
+
 const buildUpstreamRequest = (
   payload: ValidatedTestChatPayload,
   forceStream: boolean,
@@ -159,6 +213,17 @@ const buildUpstreamRequest = (
         'anthropic-version': '2023-06-01',
       },
       body: convertOpenAiPayloadToClaudeBody(payload, forceStream),
+    };
+  }
+
+  if (payload.targetFormat === 'responses') {
+    return {
+      url: `http://127.0.0.1:${config.port}/v1/responses`,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${config.proxyToken}`,
+      },
+      body: convertOpenAiPayloadToResponsesBody(payload, forceStream),
     };
   }
 

@@ -22,8 +22,17 @@ import {
   serializeFinalResponse,
   buildSyntheticOpenAiChunks,
 } from './chatFormats.js';
+import {
+  buildUpstreamEndpointRequest,
+  isEndpointDowngradeError,
+  resolveUpstreamEndpointCandidates,
+} from './upstreamEndpoint.js';
 
 const MAX_RETRIES = 2;
+
+function withUpstreamPath(path: string, message: string): string {
+  return `[upstream:${path}] ${message}`;
+}
 
 export async function chatProxyRoute(app: FastifyInstance) {
   app.post('/v1/chat/completions', async (request: FastifyRequest, reply: FastifyReply) =>
@@ -72,54 +81,93 @@ async function handleChatProxyRequest(
 
     excludeChannelIds.push(selected.channel.id);
 
-    const targetUrl = `${selected.site.url}/v1/chat/completions`;
-    const forwardBody = {
-      ...upstreamBody,
-      model: selected.actualModel,
-      stream: isStream,
-    };
-    const startTime = Date.now();
+    const modelName = selected.actualModel || requestedModel;
+    const endpointCandidates = await resolveUpstreamEndpointCandidates(
+      {
+        site: selected.site,
+        account: selected.account,
+      },
+      modelName,
+      downstreamFormat,
+    );
+    let startTime = Date.now();
 
     try {
-      const upstream = await fetch(targetUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${selected.tokenValue}`,
-        },
-        body: JSON.stringify(forwardBody),
-      });
+      let upstream: Awaited<ReturnType<typeof fetch>> | null = null;
+      let successfulUpstreamPath: string | null = null;
+      let finalStatus = 0;
+      let finalErrText = 'unknown error';
 
-      if (!upstream.ok) {
-        const errText = await upstream.text().catch(() => 'unknown error');
+      for (let endpointIndex = 0; endpointIndex < endpointCandidates.length; endpointIndex += 1) {
+        const endpointRequest = buildUpstreamEndpointRequest({
+          endpoint: endpointCandidates[endpointIndex],
+          modelName,
+          stream: isStream,
+          tokenValue: selected.tokenValue,
+          openaiBody: upstreamBody,
+        });
+
+        const targetUrl = `${selected.site.url}${endpointRequest.path}`;
+        startTime = Date.now();
+
+        const response = await fetch(targetUrl, {
+          method: 'POST',
+          headers: endpointRequest.headers,
+          body: JSON.stringify(endpointRequest.body),
+        });
+
+        if (response.ok) {
+          upstream = response;
+          successfulUpstreamPath = endpointRequest.path;
+          break;
+        }
+
+        const rawErrText = await response.text().catch(() => 'unknown error');
+        const errText = withUpstreamPath(endpointRequest.path, rawErrText);
+        const shouldDowngradeEndpoint = (
+          endpointIndex < endpointCandidates.length - 1
+          && isEndpointDowngradeError(response.status, rawErrText)
+        );
+
+        if (shouldDowngradeEndpoint) {
+          logProxy(selected, requestedModel, 'failed', response.status, Date.now() - startTime, errText, retryCount);
+          continue;
+        }
+
+        finalStatus = response.status;
+        finalErrText = errText;
+        break;
+      }
+
+      if (!upstream) {
+        const status = finalStatus || 502;
+        const errText = finalErrText || 'unknown error';
         tokenRouter.recordFailure(selected.channel.id);
-        logProxy(selected, requestedModel, 'failed', upstream.status, Date.now() - startTime, errText, retryCount);
+        logProxy(selected, requestedModel, 'failed', status, Date.now() - startTime, errText, retryCount);
 
-        if (isTokenExpiredError({ status: upstream.status, message: errText })) {
+        if (isTokenExpiredError({ status, message: errText })) {
           await reportTokenExpired({
             accountId: selected.account.id,
             username: selected.account.username,
             siteName: selected.site.name,
-            detail: `HTTP ${upstream.status}`,
+            detail: `HTTP ${status}`,
           });
         }
 
-        if (shouldRetryProxyRequest(upstream.status, errText) && retryCount < MAX_RETRIES) {
+        if (shouldRetryProxyRequest(status, errText) && retryCount < MAX_RETRIES) {
           retryCount += 1;
           continue;
         }
 
         await reportProxyAllFailed({
           model: requestedModel,
-          reason: `upstream returned HTTP ${upstream.status}`,
+          reason: `upstream returned HTTP ${status}`,
         });
 
-        return reply.code(upstream.status).send({
+        return reply.code(status).send({
           error: { message: errText, type: 'upstream_error' },
         });
       }
-
-      const modelName = selected.actualModel || requestedModel;
 
       if (isStream) {
         reply.hijack();
@@ -232,6 +280,7 @@ async function handleChatProxyRequest(
             resolvedUsage.completionTokens,
             resolvedUsage.totalTokens,
             estimatedCost,
+            successfulUpstreamPath,
           );
           return;
         }
@@ -348,6 +397,7 @@ async function handleChatProxyRequest(
           resolvedUsage.completionTokens,
           resolvedUsage.totalTokens,
           estimatedCost,
+          successfulUpstreamPath,
         );
         return;
       }
@@ -407,6 +457,7 @@ async function handleChatProxyRequest(
         resolvedUsage.completionTokens,
         resolvedUsage.totalTokens,
         estimatedCost,
+        successfulUpstreamPath,
       );
 
       return reply.send(downstreamResponse);
@@ -446,8 +497,11 @@ function logProxy(
   completionTokens = 0,
   totalTokens = 0,
   estimatedCost = 0,
+  upstreamPath: string | null = null,
 ) {
   try {
+    const normalizedErrorMessage = errorMessage
+      || (upstreamPath ? `[upstream:${upstreamPath}]` : null);
     db.insert(schema.proxyLogs).values({
       routeId: selected.channel.routeId,
       channelId: selected.channel.id,
@@ -461,7 +515,7 @@ function logProxy(
       completionTokens,
       totalTokens,
       estimatedCost,
-      errorMessage,
+      errorMessage: normalizedErrorMessage,
       retryCount,
     }).run();
   } catch {}

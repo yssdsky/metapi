@@ -545,7 +545,7 @@ export async function settingsRoutes(app: FastifyInstance) {
         successMessage: (currentTask) => {
           const rebuild = (currentTask.result as any)?.rebuild;
           if (!rebuild) return '缓存清理后重建路由已完成';
-          return `缓存清理后重建完成：新增路由 ${rebuild.createdRoutes}，新增通道 ${rebuild.createdChannels}，移除通道 ${rebuild.removedChannels}`;
+          return `缓存清理后重建完成：新增路由 ${rebuild.createdRoutes}，移除旧路由 ${rebuild.removedRoutes ?? 0}，新增通道 ${rebuild.createdChannels}，移除通道 ${rebuild.removedChannels}`;
         },
         failureMessage: (currentTask) => `缓存清理后重建失败：${currentTask.error || 'unknown error'}`,
       },

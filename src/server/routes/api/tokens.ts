@@ -336,7 +336,7 @@ export async function tokensRoutes(app: FastifyInstance) {
         successMessage: (currentTask) => {
           const rebuild = (currentTask.result as any)?.rebuild;
           if (!rebuild) return '刷新模型并重建路由已完成';
-          return `刷新模型并重建路由完成：新增路由 ${rebuild.createdRoutes}，新增通道 ${rebuild.createdChannels}，移除通道 ${rebuild.removedChannels}`;
+          return `刷新模型并重建路由完成：新增路由 ${rebuild.createdRoutes}，移除旧路由 ${rebuild.removedRoutes ?? 0}，新增通道 ${rebuild.createdChannels}，移除通道 ${rebuild.removedChannels}`;
         },
         failureMessage: (currentTask) => `刷新模型并重建路由失败：${currentTask.error || 'unknown error'}`,
       },

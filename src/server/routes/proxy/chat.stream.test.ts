@@ -10,6 +10,7 @@ const refreshModelsAndRebuildRoutesMock = vi.fn();
 const reportProxyAllFailedMock = vi.fn();
 const reportTokenExpiredMock = vi.fn();
 const estimateProxyCostMock = vi.fn(async (_arg?: any) => 0);
+const fetchModelPricingCatalogMock = vi.fn(async (_arg?: any): Promise<any> => null);
 const resolveProxyUsageWithSelfLogFallbackMock = vi.fn(async ({ usage }: any) => ({
   ...usage,
   estimatedCostFromQuota: 0,
@@ -49,6 +50,7 @@ vi.mock('../../services/alertRules.js', () => ({
 
 vi.mock('../../services/modelPricingService.js', () => ({
   estimateProxyCost: (arg: any) => estimateProxyCostMock(arg),
+  fetchModelPricingCatalog: (arg: any) => fetchModelPricingCatalogMock(arg),
 }));
 
 vi.mock('../../services/proxyRetryPolicy.js', () => ({
@@ -73,9 +75,11 @@ describe('chat proxy stream behavior', () => {
 
   beforeAll(async () => {
     const { chatProxyRoute, claudeMessagesProxyRoute } = await import('./chat.js');
+    const { responsesProxyRoute } = await import('./responses.js');
     app = Fastify();
     await app.register(chatProxyRoute);
     await app.register(claudeMessagesProxyRoute);
+    await app.register(responsesProxyRoute);
   });
 
   beforeEach(() => {
@@ -88,6 +92,7 @@ describe('chat proxy stream behavior', () => {
     reportProxyAllFailedMock.mockReset();
     reportTokenExpiredMock.mockReset();
     estimateProxyCostMock.mockClear();
+    fetchModelPricingCatalogMock.mockReset();
     resolveProxyUsageWithSelfLogFallbackMock.mockClear();
     dbInsertMock.mockClear();
 
@@ -100,6 +105,7 @@ describe('chat proxy stream behavior', () => {
       actualModel: 'upstream-gpt',
     });
     selectNextChannelMock.mockReturnValue(null);
+    fetchModelPricingCatalogMock.mockResolvedValue(null);
   });
 
   afterAll(async () => {
@@ -139,6 +145,23 @@ describe('chat proxy stream behavior', () => {
     expect(response.body).toContain('"chat.completion.chunk"');
     expect(response.body).toContain('hello from upstream');
     expect(response.body).toContain('data: [DONE]');
+  });
+
+  it('returns clear 400 when /v1/chat/completions receives responses-style input without messages', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'claude-haiku-4-5-20251001',
+        input: 'hello',
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    const body = response.json();
+    expect(body?.error?.type).toBe('invalid_request_error');
+    expect(body?.error?.message).toContain('/v1/responses');
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('sets anti-buffering SSE headers for streamed chat responses', async () => {
@@ -313,5 +336,413 @@ describe('chat proxy stream behavior', () => {
     expect(response.body).toContain('event: content_block_delta');
     expect(response.body).toContain('\"text\":\"hello\"');
     expect(response.body).toContain('event: message_stop');
+  });
+
+  it('serves /v1/responses via protocol translation when upstream is OpenAI-compatible', async () => {
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({
+      id: 'resp_123',
+      object: 'response',
+      output_text: 'hello from responses',
+      usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      payload: {
+        model: 'gpt-5.2',
+        input: 'hello',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.object).toBe('response');
+    expect(body.output_text).toContain('hello from responses');
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [targetUrl, options] = fetchMock.mock.calls[0] as [string, any];
+    expect(targetUrl).toContain('/v1/chat/completions');
+    const forwarded = JSON.parse(options.body);
+    expect(forwarded.model).toBe('upstream-gpt');
+  });
+
+  it('passes through /v1/responses SSE payloads', async () => {
+    const encoder = new TextEncoder();
+    const upstreamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hello"}\n\n'));
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+        controller.close();
+      },
+    });
+
+    fetchMock.mockResolvedValue(new Response(upstreamBody, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      payload: {
+        model: 'gpt-5.2',
+        input: 'hello',
+        stream: true,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['content-type']).toContain('text/event-stream');
+    expect(response.body).toContain('response.output_text.delta');
+    expect(response.body).toContain('[DONE]');
+  });
+
+  it('routes /v1/responses to /v1/messages when upstream catalog is anthropic-only', async () => {
+    fetchModelPricingCatalogMock.mockResolvedValue({
+      models: [
+        {
+          modelName: 'upstream-gpt',
+          supportedEndpointTypes: ['anthropic'],
+        },
+      ],
+      groupRatio: {},
+    });
+
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({
+      id: 'msg_900',
+      type: 'message',
+      model: 'upstream-gpt',
+      content: [{ type: 'text', text: 'hello from anthropic messages upstream' }],
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      payload: {
+        model: 'claude-haiku-4-5-20251001',
+        input: 'hello',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.object).toBe('response');
+    expect(body.output_text).toContain('hello from anthropic messages upstream');
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [targetUrl] = fetchMock.mock.calls[0] as [string, any];
+    expect(targetUrl).toContain('/v1/messages');
+  });
+
+  it('forces anyrouter platform to prefer /v1/messages even when catalog says openai', async () => {
+    selectChannelMock.mockReturnValue({
+      channel: { id: 11, routeId: 22 },
+      site: { name: 'anyrouter-site', url: 'https://anyrouter.example.com', platform: 'anyrouter' },
+      account: { id: 33, username: 'demo-user' },
+      tokenName: 'default',
+      tokenValue: 'sk-demo',
+      actualModel: 'upstream-gpt',
+    });
+    fetchModelPricingCatalogMock.mockResolvedValue({
+      models: [
+        {
+          modelName: 'upstream-gpt',
+          supportedEndpointTypes: ['openai'],
+        },
+      ],
+      groupRatio: {},
+    });
+
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({
+      id: 'msg_anyrouter',
+      type: 'message',
+      model: 'upstream-gpt',
+      content: [{ type: 'text', text: 'anyrouter prefers messages' }],
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 6, output_tokens: 2, total_tokens: 8 },
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'claude-haiku-4-5-20251001',
+        stream: false,
+        messages: [{ role: 'user', content: 'hello' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body?.choices?.[0]?.message?.content).toContain('anyrouter prefers messages');
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [targetUrl] = fetchMock.mock.calls[0] as [string, any];
+    expect(targetUrl).toContain('/v1/messages');
+  });
+
+  it('chooses /v1/messages upstream when catalog indicates messages-only endpoint support', async () => {
+    fetchModelPricingCatalogMock.mockResolvedValue({
+      models: [
+        {
+          modelName: 'upstream-gpt',
+          supportedEndpointTypes: ['/v1/messages'],
+        },
+      ],
+      groupRatio: {},
+    });
+
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({
+      id: 'msg_100',
+      type: 'message',
+      model: 'upstream-gpt',
+      content: [{ type: 'text', text: 'hello from messages only' }],
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 8, output_tokens: 4, total_tokens: 12 },
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'claude-haiku-4-5-20251001',
+        stream: false,
+        messages: [{ role: 'user', content: 'hello' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body?.choices?.[0]?.message?.content).toContain('hello from messages only');
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [targetUrl] = fetchMock.mock.calls[0] as [string, any];
+    expect(targetUrl).toContain('/v1/messages');
+  });
+
+  it('prefers OpenAI-compatible endpoint when catalog uses generic openai/anthropic labels', async () => {
+    fetchModelPricingCatalogMock.mockResolvedValue({
+      models: [
+        {
+          modelName: 'upstream-gpt',
+          supportedEndpointTypes: ['anthropic', 'openai'],
+        },
+      ],
+      groupRatio: {},
+    });
+
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({
+      id: 'chatcmpl-openai-first',
+      object: 'chat.completion',
+      created: 1_706_000_002,
+      model: 'upstream-gpt',
+      choices: [{
+        index: 0,
+        message: { role: 'assistant', content: 'hello from openai endpoint' },
+        finish_reason: 'stop',
+      }],
+      usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'claude-haiku-4-5-20251001',
+        stream: false,
+        messages: [{ role: 'user', content: 'hello' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body?.choices?.[0]?.message?.content).toContain('hello from openai endpoint');
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [targetUrl] = fetchMock.mock.calls[0] as [string, any];
+    expect(targetUrl).toContain('/v1/chat/completions');
+  });
+
+  it('falls back to /v1/messages when catalog only declares openai and chat endpoint fails', async () => {
+    fetchModelPricingCatalogMock.mockResolvedValue({
+      models: [
+        {
+          modelName: 'upstream-gpt',
+          supportedEndpointTypes: ['openai'],
+        },
+      ],
+      groupRatio: {},
+    });
+
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        error: {
+          message: 'openai_error',
+          type: 'bad_response_status_code',
+          code: 'bad_response_status_code',
+        },
+      }), {
+        status: 400,
+        headers: { 'content-type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        id: 'msg_fallback_500',
+        type: 'message',
+        model: 'upstream-gpt',
+        content: [{ type: 'text', text: 'fallback to messages from openai-only catalog' }],
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 12, output_tokens: 7, total_tokens: 19 },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'claude-haiku-4-5-20251001',
+        stream: false,
+        messages: [{ role: 'user', content: 'hello' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body?.choices?.[0]?.message?.content).toContain('fallback to messages from openai-only catalog');
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const [firstUrl] = fetchMock.mock.calls[0] as [string, any];
+    const [secondUrl] = fetchMock.mock.calls[1] as [string, any];
+    expect(firstUrl).toContain('/v1/chat/completions');
+    expect(secondUrl).toContain('/v1/messages');
+  });
+
+  it('downgrades endpoint when upstream returns convert_request_failed/not implemented', async () => {
+    fetchModelPricingCatalogMock.mockResolvedValue({
+      models: [
+        {
+          modelName: 'upstream-gpt',
+          supportedEndpointTypes: ['/v1/chat/completions', '/v1/messages'],
+        },
+      ],
+      groupRatio: {},
+    });
+
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        error: {
+          message: 'not implemented (request id: abc123)',
+          type: 'new_api_error',
+          code: 'convert_request_failed',
+        },
+      }), {
+        status: 400,
+        headers: { 'content-type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        id: 'msg_200',
+        type: 'message',
+        model: 'upstream-gpt',
+        content: [{ type: 'text', text: 'fallback from messages' }],
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 11, output_tokens: 6, total_tokens: 17 },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'claude-haiku-4-5-20251001',
+        stream: false,
+        messages: [{ role: 'user', content: 'hello' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body?.choices?.[0]?.message?.content).toContain('fallback from messages');
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const [firstUrl] = fetchMock.mock.calls[0] as [string, any];
+    const [secondUrl] = fetchMock.mock.calls[1] as [string, any];
+    expect(firstUrl).toContain('/v1/chat/completions');
+    expect(secondUrl).toContain('/v1/messages');
+  });
+
+  it('downgrades endpoint when upstream returns openai_error bad_response_status_code', async () => {
+    fetchModelPricingCatalogMock.mockResolvedValue({
+      models: [
+        {
+          modelName: 'upstream-gpt',
+          supportedEndpointTypes: ['/v1/chat/completions', '/v1/messages'],
+        },
+      ],
+      groupRatio: {},
+    });
+
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        error: {
+          message: 'openai_error',
+          type: 'bad_response_status_code',
+          code: 'bad_response_status_code',
+        },
+      }), {
+        status: 400,
+        headers: { 'content-type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        id: 'msg_300',
+        type: 'message',
+        model: 'upstream-gpt',
+        content: [{ type: 'text', text: 'fallback from bad_response_status_code' }],
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 9, output_tokens: 5, total_tokens: 14 },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'claude-haiku-4-5-20251001',
+        stream: false,
+        messages: [{ role: 'user', content: 'hello' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body?.choices?.[0]?.message?.content).toContain('fallback from bad_response_status_code');
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const [firstUrl] = fetchMock.mock.calls[0] as [string, any];
+    const [secondUrl] = fetchMock.mock.calls[1] as [string, any];
+    expect(firstUrl).toContain('/v1/chat/completions');
+    expect(secondUrl).toContain('/v1/messages');
   });
 });

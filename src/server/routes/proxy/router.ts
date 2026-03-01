@@ -4,6 +4,7 @@ import { chatProxyRoute, claudeMessagesProxyRoute } from './chat.js';
 import { modelsProxyRoute } from './models.js';
 import { embeddingsProxyRoute } from './embeddings.js';
 import { completionsProxyRoute } from './completions.js';
+import { responsesProxyRoute } from './responses.js';
 import { imagesProxyRoute } from './images.js';
 
 export async function proxyRoutes(app: FastifyInstance) {
@@ -15,6 +16,7 @@ export async function proxyRoutes(app: FastifyInstance) {
   await app.register(chatProxyRoute);
   await app.register(claudeMessagesProxyRoute);
   await app.register(completionsProxyRoute);
+  await app.register(responsesProxyRoute);
   await app.register(modelsProxyRoute);
   await app.register(embeddingsProxyRoute);
   await app.register(imagesProxyRoute);

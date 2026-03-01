@@ -20,15 +20,21 @@ describe('proxyRetryPolicy', () => {
     ).toBe(true);
   });
 
-  it('does not retry on generic client request errors', () => {
+  it('retries on generic client request errors for cross-channel fallback', () => {
     expect(
       shouldRetryProxyRequest(400, '{"error":{"message":"invalid request body"}}'),
-    ).toBe(false);
+    ).toBe(true);
     expect(
       shouldRetryProxyRequest(401, '{"error":{"message":"invalid access token"}}'),
-    ).toBe(false);
+    ).toBe(true);
     expect(
       shouldRetryProxyRequest(403, '{"error":{"message":"forbidden"}}'),
-    ).toBe(false);
+    ).toBe(true);
+    expect(
+      shouldRetryProxyRequest(404, '{"error":{"message":"not found"}}'),
+    ).toBe(true);
+    expect(
+      shouldRetryProxyRequest(422, '{"error":{"message":"unprocessable"}}'),
+    ).toBe(true);
   });
 });

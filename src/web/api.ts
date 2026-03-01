@@ -87,7 +87,7 @@ async function request(url: string, options: RequestOptions = {}) {
 type TestChatRequestPayload = {
   model: string;
   messages: Array<{ role: string; content: string }>;
-  targetFormat?: 'openai' | 'claude';
+  targetFormat?: 'openai' | 'claude' | 'responses';
   stream?: boolean;
   temperature?: number;
   top_p?: number;

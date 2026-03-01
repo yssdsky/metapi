@@ -16,6 +16,10 @@ function normalizeModels(models: string[]): string[] {
   return Array.from(new Set(models.filter((model) => typeof model === 'string' && model.trim().length > 0)));
 }
 
+function isExactModelPattern(modelPattern: string): boolean {
+  return !/[\*\?\[]/.test(modelPattern);
+}
+
 async function withTimeout<T>(fn: () => Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | null = null;
   try {
@@ -214,6 +218,7 @@ export function rebuildTokenRoutesFromAvailability() {
   let createdRoutes = 0;
   let createdChannels = 0;
   let removedChannels = 0;
+  let removedRoutes = 0;
 
   for (const [modelName, tokenAccountMap] of modelTokens.entries()) {
     let route = routes.find((r) => r.modelPattern === modelName);
@@ -269,11 +274,30 @@ export function rebuildTokenRoutesFromAvailability() {
     }
   }
 
+  const latestModelNames = new Set<string>(Array.from(modelTokens.keys()));
+  for (const route of routes) {
+    const modelPattern = (route.modelPattern || '').trim();
+    if (!modelPattern || !isExactModelPattern(modelPattern) || latestModelNames.has(modelPattern)) {
+      continue;
+    }
+
+    const routeChannelCount = channels.filter((channel) => channel.routeId === route.id).length;
+    if (routeChannelCount > 0) {
+      removedChannels += routeChannelCount;
+    }
+
+    const deleted = db.delete(schema.tokenRoutes).where(eq(schema.tokenRoutes.id, route.id)).run().changes;
+    if (deleted > 0) {
+      removedRoutes += deleted;
+    }
+  }
+
   return {
     models: modelTokens.size,
     createdRoutes,
     createdChannels,
     removedChannels,
+    removedRoutes,
   };
 }
 

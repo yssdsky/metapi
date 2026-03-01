@@ -192,7 +192,7 @@ export async function statsRoutes(app: FastifyInstance) {
           successMessage: (currentTask) => {
             const rebuild = (currentTask.result as any)?.rebuild;
             if (!rebuild) return '模型广场刷新已完成';
-            return `模型广场刷新完成：新增路由 ${rebuild.createdRoutes}，新增通道 ${rebuild.createdChannels}，移除通道 ${rebuild.removedChannels}`;
+            return `模型广场刷新完成：新增路由 ${rebuild.createdRoutes}，移除旧路由 ${rebuild.removedRoutes ?? 0}，新增通道 ${rebuild.createdChannels}，移除通道 ${rebuild.removedChannels}`;
           },
           failureMessage: (currentTask) => `模型广场刷新失败：${currentTask.error || 'unknown error'}`,
         },
